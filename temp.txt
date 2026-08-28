@@ -1,0 +1,78 @@
+
+## 1. Sourcing the Data Files
+
+**Target Images (LROC NAC via QuickMap)**
+
+* Open the LROC QuickMap link.
+* Locate your test region (the Vikram Lander site).
+* Use the **Export Tool** (often an icon resembling a download arrow or bounding box selection).
+* Draw a tight bounding box around the specific craters you want to match.
+* Select **GeoTIFF (.tif)** as the export format.
+* **Crucial:** Note the exact projection (CRS/EPSG code) QuickMap uses for this export. You will need it to align the Chandrayaan data later.
+
+**Source Images (Chandrayaan-2 via ISSDC PRADAN)**
+
+* Download the **Calibrated (RDR)** zip bundle for the exact same coordinate box.
+* Extract the ZIP. Planetary Data System v4 (PDS4) architecture separates metadata from raw binary pixels.
+* You will see an `.xml` file (the label containing map geometry) and an `.img` or `.dat` file (the raw pixel array).
+* **Rule:** Keep both files in the exact same directory. GDAL will read the `.xml`, parse the coordinates, and automatically locate the paired binary file.
+
+## 2. Environment Foundation
+
+Do not use standard `pip` to install GDAL on Windows; the C++ compiler bindings will fail. Use `conda` to enforce strict binary compatibility.
+
+```bash
+conda create -n lunar_env python=3.11
+conda activate lunar_env
+conda install -c conda-forge gdal rasterio numpy opencv scikit-image
+
+```
+
+## 3. C-Level Memory Optimization (Windowed Reading)
+
+Lunar satellite images are tens of thousands of pixels wide. Loading an entire array via `cv2.imread()` will trigger an Out-Of-Memory (OOM) crash. You must stream small, calculable chunks from the hard drive directly into RAM using `rasterio` windows.
+
+```python
+import rasterio
+from rasterio.windows import Window
+import numpy as np
+
+# Point directly to the PDS4 XML, not the IMG file.
+ch2_xml_path = "dataset/ch2_calibrated.xml"
+
+# Open the dataset without loading the array into memory
+with rasterio.open(ch2_xml_path) as src:
+    print(f"Dataset CRS: {src.crs}")
+    print(f"Full Dimensions: {src.width} x {src.height}")
+    
+    # Define a 1024x1024 patch (starting at X: 5000, Y: 5000)
+    col_start, row_start = 5000, 5000
+    patch_size = 1024
+    
+    window = Window(col_off=col_start, row_off=row_start, width=patch_size, height=patch_size)
+    
+    # Pre-allocate a C-contiguous float array to prevent memory fragmentation
+    ch2_patch = np.zeros((patch_size, patch_size), dtype=np.float32)
+    
+    # Read strictly the requested window into the pre-allocated array
+    ch2_patch = src.read(1, window=window)
+
+```
+
+## 4. Geometric & Resolution Standardization
+
+Before passing these NumPy arrays to your deep learning or classical CV models, you must normalize their map geometry and pixel scales.
+
+**Coordinate Reprojection**
+Chandrayaan-2 and LROC NAC will likely use different spatial grid systems. You must warp the Chandrayaan-2 chunk to mathematically overlay the LROC NAC chunk.
+
+* Use `rasterio.warp.reproject`.
+* Pass the Chandrayaan-2 array as the source, and set the destination CRS to the exact projection you noted when downloading the QuickMap GeoTIFF.
+
+**Scale Pyramiding**
+OHRC resolution is roughly 0.25 meters per pixel. LROC NAC is roughly 0.5 to 1.5 meters per pixel.
+
+* If you feed these into a matcher directly, the crater sizes will be drastically mismatched.
+* Use OpenCV's Gaussian Pyramids (`cv2.pyrDown()`) on the OHRC arrays to sequentially halve their resolution until the physical ground-sample distance (GSD) matches the LROC NAC reference patch.
+
+Execute these standardizations precisely. Feed the resulting normalized, chunked NumPy arrays directly to Ambreesh and Sagar for the Phase Congruency and deep-learning matching pipelines.
